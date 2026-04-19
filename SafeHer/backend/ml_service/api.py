@@ -1,35 +1,38 @@
-from dotenv import load_dotenv
-load_dotenv()
-
-from fastapi import FastAPI, HTTPException, File, UploadFile, Form
+from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from typing import List
 import joblib
 import numpy as np
 import pandas as pd
+
+app = FastAPI()
+
 import os
 
-# Import our strictly separated modules
-import blockchain_module
-import ml_data_module
-
-app = FastAPI(title="SafeHer Unified API")
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # =========================
 # 📦 LOAD MODEL + DATA
 # =========================
 try:
-    model = joblib.load("model.pkl")
-    df = pd.read_csv("processed_data.csv")
+    model_path = os.path.join(BASE_DIR, "model.pkl")
+    data_path = os.path.join(BASE_DIR, "processed_data.csv")
+    model = joblib.load(model_path)
+    df = pd.read_csv(data_path)
 except Exception as e:
-    raise RuntimeError(f"Error loading model/data: {e}")
+    print(f"Error loading model/data: {e}")
+    # We'll handle this gracefully so the main app doesn't crash
+    model = None
+    df = None
+
 
 # =========================
-# 📌 REQUEST MODEL FOR ML (Fixes 422)
+# 📌 REQUEST MODEL (Fixes 422)
 # =========================
 class RouteRequest(BaseModel):
     coordinates: List[List[float]]
 
+    # Validate coordinates format
     @classmethod
     def validate(cls, value):
         for point in value.get("coordinates", []):
@@ -37,16 +40,19 @@ class RouteRequest(BaseModel):
                 raise ValueError("Each coordinate must be [lat, lng]")
         return value
 
+
 # =========================
 # 🔥 FEATURE CONFIG
 # =========================
 try:
     feature_columns = model.get_booster().feature_names
 except:
+    # fallback (remove non-feature columns manually)
     feature_columns = [
         col for col in df.columns
         if col not in ["target", "label"]
     ]
+
 
 # =========================
 # 📍 FIND NEAREST POINT
@@ -56,53 +62,83 @@ def find_nearest(lat, lng):
     idx = distances.idxmin()
     return df.iloc[idx]
 
+
 # =========================
 # 🧠 FEATURE EXTRACTION
 # =========================
 def extract_features_from_route(coords):
+
     features_list = []
     explanations = []
 
     for lat, lng in coords:
+
         nearest = find_nearest(lat, lng)
+
         row = []
+
+        # 🔥 MATCH MODEL FEATURES EXACTLY
         for col in feature_columns:
             if col in nearest:
                 row.append(nearest[col])
             else:
-                row.append(0)
+                row.append(0)  # fallback
 
         features_list.append(row)
 
+        # =========================
+        # 💡 EXPLANATION ENGINE
+        # =========================
         reasons = []
+
         if "complaint_count" in nearest and nearest["complaint_count"] > 5:
             reasons.append("High complaint area")
+
         if "distance_to_hotspot_raw" in nearest and nearest["distance_to_hotspot_raw"] < 0.5:
             reasons.append("Near crime hotspot")
+
         if "is_night" in nearest and nearest["is_night"] == 1:
             reasons.append("Night time risk")
+
         if "is_forest" in nearest and nearest["is_forest"] == 1:
             reasons.append("Isolated area")
+
         if "severity" in nearest and nearest["severity"] > 2:
             reasons.append("High severity incidents")
+
         explanations.append(reasons)
 
     return np.array(features_list), explanations
 
+
 # =========================
-# 🚀 MAIN ML API
+# 🚀 MAIN API
 # =========================
 @app.post("/predict")
 def predict(data: RouteRequest):
+
     try:
         coords = data.coordinates
+
         if not coords:
             raise HTTPException(status_code=400, detail="Coordinates cannot be empty")
 
         feature_matrix, explanations = extract_features_from_route(coords)
+
+        # 🔍 DEBUG (optional)
+        print("Expected features:", len(feature_columns))
+        print("Given features:", len(feature_matrix[0]))
+
         predictions = model.predict(feature_matrix)
+
+        # =========================
+        # 🎯 FINAL SCORE
+        # =========================
         final_score = int(np.mean(predictions))
 
+        # =========================
+        # 📍 SEGMENT DETAILS
+        # =========================
         segments = []
         for i, (latlng, pred) in enumerate(zip(coords, predictions)):
             segments.append({
@@ -112,6 +148,9 @@ def predict(data: RouteRequest):
                 "reasons": explanations[i]
             })
 
+        # =========================
+        # 🧠 SUMMARY
+        # =========================
         all_reasons = [r for sub in explanations for r in sub]
         summary = list(set(all_reasons)) if all_reasons else ["Low risk area"]
 
@@ -121,9 +160,14 @@ def predict(data: RouteRequest):
             "summary": summary,
             "segments": segments
         }
+
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+
+# =========================
+# 🏷️ LABEL MAPPING
+# =========================
 def get_label(score):
     if score == 0:
         return "SAFE"
@@ -131,77 +175,3 @@ def get_label(score):
         return "MODERATE"
     else:
         return "RISKY"
-
-# =========================
-# 🔗 BLOCKCHAIN ENUMS & MODELS
-# =========================
-INCIDENT_MAP = {
-    "Harassment": 0,
-    "Stalking": 1,
-    "Suspicious": 2,
-    "Other": 3
-}
-
-class ResolveReportRequest(BaseModel):
-    report_id: int
-    secret: str
-
-# =========================
-# 🚀 REPORTING APIs
-# =========================
-@app.post("/api/reports/submit")
-async def submit_report(
-    lat: float = Form(...),
-    lng: float = Form(...),
-    incident_type: str = Form(...),
-    description: str = Form(""),
-    suspect_name: str = Form(""),
-    evidence_file: UploadFile = File(...)
-):
-    try:
-        file_content = await evidence_file.read()
-        blockchain_result = await blockchain_module.submit_to_blockchain_layer(
-            lat=lat,
-            lng=lng,
-            mapped_type=INCIDENT_MAP.get(incident_type, 3),
-            suspect_name=suspect_name,
-            description=description,
-            evidence_file_name=evidence_file.filename,
-            evidence_file_content=file_content
-        )
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Blockchain Layer Error: {str(e)}")
-
-    ml_data_module.save_raw_data_for_ml(
-        lat=lat,
-        lng=lng,
-        incident_type=incident_type,
-        description=description,
-        suspect_name=suspect_name,
-        evidence_url=blockchain_result["ipfs_url"],
-        ipfs_cid=blockchain_result["ipfs_cid"]
-    )
-
-    return {
-        "status": "success",
-        "blockchain_receipt": blockchain_result["blockchain_receipt"],
-        "ipfs_url": blockchain_result["ipfs_url"],
-        "resolution_secret": blockchain_result["resolution_secret"],
-        "message": "Report successfully filed on-chain and cached for ML mapping."
-    }
-
-@app.post("/api/reports/resolve")
-async def resolve_report(request: ResolveReportRequest):
-    try:
-        receipt_url = blockchain_module.resolve_on_chain(request.report_id, request.secret)
-        return {
-            "status": "success",
-            "message": "Report permanently marked as Resolved on Web3.",
-            "blockchain_receipt": receipt_url
-        }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Blockchain resolution failed: {str(e)}")
-
-@app.get("/")
-def read_root():
-    return {"message": "SafeHer Unified Backend: Modular Architecture Online (ML + Blockchain)"}
